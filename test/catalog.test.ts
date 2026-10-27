@@ -45,20 +45,43 @@ test("defers active tools and skills that nothing keeps", () => {
   assert.deepEqual(plan.deferredSkills, ["deploy-guide"]);
 });
 
-test("renders a minimal index with --- group headers and name lists", () => {
+test("renders deferred names with catalog descriptions without exposing kept capabilities", () => {
   const index = renderIndex("Load these first.", {
     deferredTools: [{ name: "browser_open", group: "browser-kit" }, { name: "deploy_run", group: "ops-kit" },
       { name: "browser_click", group: "browser-kit" }],
     deferredSkills: ["deploy-guide", "game-feel"],
+  }, {
+    tools: [tool("browser_open", "browser-kit"), tool("browser_click", "browser-kit"), tool("deploy_run", "ops-kit"), tool("read", "builtin")],
+    skills: [skill("deploy-guide"), skill("game-feel"), skill("writer-voice")],
   });
   assert.equal(index, [
     "Load these first.",
     "--- browser-kit tools",
-    "browser_open, browser_click",
+    "- browser_open: browser_open does one thing. More detail.",
+    "- browser_click: browser_click does one thing. More detail.",
     "--- ops-kit tools",
-    "deploy_run",
+    "- deploy_run: deploy_run does one thing. More detail.",
     "--- skills",
-    "deploy-guide, game-feel",
+    "- deploy-guide: Use deploy-guide for its workflow.",
+    "- game-feel: Use game-feel for its workflow.",
   ].join("\n"));
-  assert.equal(renderIndex("Load these first.", { deferredTools: [], deferredSkills: [] }), "");
+  assert.equal(renderIndex("Load these first.", { deferredTools: [], deferredSkills: [] }, { tools: [], skills: [] }), "");
+});
+
+test("bounds single-line index descriptions and retains names when metadata is missing", () => {
+  const index = renderIndex("Load these first.", {
+    deferredTools: [{ name: "browser_open", group: "browser-kit" }, { name: "missing_tool", group: "browser-kit" }],
+    deferredSkills: ["deploy-guide"],
+  }, {
+    tools: [{ ...tool("browser_open", "browser-kit"), description: "Open a page.\n\tUse for signed-in browsing. " + "More detail. ".repeat(100) }],
+    skills: [{ ...skill("deploy-guide"), description: "x".repeat(900) }],
+  });
+  const lines = index.split("\n");
+  const toolLine = lines.find((line) => line.startsWith("- browser_open: "));
+  assert.ok(toolLine);
+  assert.match(toolLine, /^- browser_open: Open a page\. Use for signed-in browsing\./);
+  assert.ok(toolLine.slice("- browser_open: ".length).length <= 320);
+  assert.match(toolLine, /…$/);
+  assert.ok(lines.includes("- missing_tool: Description unavailable; load to inspect."));
+  assert.equal(lines.find((line) => line.startsWith("- deploy-guide: ")), "- deploy-guide: " + "x".repeat(319) + "…");
 });

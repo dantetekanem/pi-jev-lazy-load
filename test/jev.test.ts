@@ -9,7 +9,7 @@ const templates = {
 };
 const candidates = [
   ...toolCandidates([
-    { name: "browser_open", description: "Open a page in the browser. Long detail.", group: "browser-kit" },
+    { name: "browser_open", description: "Open a page in the browser.\nUse for signed-in browsing; not for local file reads.", group: "browser-kit" },
     { name: "browser_click", description: "Click an element.", group: "browser-kit" },
     { name: "deploy_run", description: "Run a deploy.", group: "ops-kit" },
   ]),
@@ -38,7 +38,19 @@ test("asks one yes/no question per candidate and maps probabilities to load and 
   assert.equal(questions.length, 3);
   assert.ok(questions.every((question) => question.type === "bool" && question.criteria.true && question.criteria.false));
   assert.match(questions[0].instructions, /browser_open: Open a page in the browser\./);
-  assert.doesNotMatch(questions[0].instructions, /Long detail/);
+  assert.match(questions[0].instructions, /Use for signed-in browsing; not for local file reads\./);
+});
+
+test("candidate descriptions retain later guidance but stay bounded for Jev", () => {
+  const description = "General workflow. " + "More context. ".repeat(40) + "Use for specialized deployments. " + "Detail. ".repeat(150);
+  const [tool] = toolCandidates([{ name: "deploy_run", group: "ops-kit", description }]);
+  const [skill] = skillCandidates([{ name: "deploy-guide", filePath: "/skills/deploy-guide/SKILL.md", description }]);
+  assert.match(tool.text, /Use for specialized deployments\./);
+  assert.match(skill.text, /Use for specialized deployments\./);
+  assert.ok(tool.text.length <= "- deploy_run: ".length + 1_000);
+  assert.ok(skill.text.length <= 1_000);
+  assert.match(tool.text, /…$/);
+  assert.match(skill.text, /…$/);
 });
 
 test("classifier errors, throws, and hangs degrade to no decision without blocking", async () => {

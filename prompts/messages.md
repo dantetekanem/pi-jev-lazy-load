@@ -1,3 +1,5 @@
+## loading-skill
+Loading skill: {{name}} - ~{{tokens}} tokens
 ## loaded-tools
 Loaded tools, available from your next call: {{names}}
 ## loaded-skills

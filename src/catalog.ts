@@ -85,13 +85,31 @@ export function planDeferral(input: {
   };
 }
 
-/** The `<lazy_capabilities>` body: the header, then `--- group tools` lines and a `--- skills` line. */
-export function renderIndex(header: string, plan: Pick<DeferralPlan, "deferredTools" | "deferredSkills">): string {
+/** Keep descriptions on one line and truncate at a word boundary when possible. */
+export function summarizeDescription(description: string, limit = 320): string {
+  const text = description.replace(/\s+/g, " ").trim();
+  if (text.length <= limit) return text;
+  const end = text.lastIndexOf(" ", limit - 1);
+  return `${text.slice(0, end > 0 ? end : limit - 1)}…`;
+}
+
+/** Describe only the persisted deferred names, using the installed catalog without changing the plan. */
+export function renderIndex(
+  header: string,
+  plan: Pick<DeferralPlan, "deferredTools" | "deferredSkills">,
+  catalog: { tools: ToolEntry[]; skills: SkillEntry[] },
+): string {
   if (plan.deferredTools.length === 0 && plan.deferredSkills.length === 0) return "";
+  const toolDescriptions = new Map(catalog.tools.map((tool) => [tool.name, tool.description]));
+  const skillDescriptions = new Map(catalog.skills.map((skill) => [skill.name, skill.description]));
+  const item = (name: string, descriptions: Map<string, string>) => {
+    const description = summarizeDescription(descriptions.get(name) ?? "");
+    return `- ${name}: ${description || "Description unavailable; load to inspect."}`;
+  };
   const groups = new Map<string, string[]>();
   for (const { name, group } of plan.deferredTools) groups.set(group, [...(groups.get(group) ?? []), name]);
   const lines = [header.trim()];
-  for (const [group, names] of groups) lines.push(`--- ${group} tools`, names.join(", "));
-  if (plan.deferredSkills.length > 0) lines.push("--- skills", plan.deferredSkills.join(", "));
+  for (const [group, names] of groups) lines.push(`--- ${group} tools`, ...names.map((name) => item(name, toolDescriptions)));
+  if (plan.deferredSkills.length > 0) lines.push("--- skills", ...plan.deferredSkills.map((name) => item(name, skillDescriptions)));
   return lines.join("\n");
 }

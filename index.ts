@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { BeforeAgentStartEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { Text } from "@earendil-works/pi-tui";
 import { groupLabel, namedInPrompt, planDeferral, renderIndex } from "./src/catalog.ts";
 import type { DeferralPlan, SkillEntry, ToolEntry } from "./src/catalog.ts";
 import { decideWithJev, skillCandidates, toolCandidates } from "./src/jev.ts";
@@ -33,6 +34,7 @@ export const DEFAULT_CONFIG: LazyLoadConfig = {
 };
 const CORE_TOOLS = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls", "codemode", "tool_search", LOADER_TOOL];
 const SECTION = "lazy_capabilities";
+const SKILL_NOTICE = "jev-skill-load";
 const STOP_WORDS = new Set(["the", "and", "for", "with", "from", "that", "this", "into", "need", "use", "using", "want"]);
 
 const readPrompt = (name: string) => readFileSync(new URL(`./prompts/${name}.md`, import.meta.url), "utf8").trim();
@@ -123,6 +125,18 @@ export function createJevLazyLoadExtension(options: { config?: Partial<LazyLoadC
       ? `- ${candidate.name} tools: ${candidate.tools.join(", ")}`
       : `- ${candidate.name}: ${candidate.text}`;
 
+    pi.registerEntryRenderer<{ message: string }>(SKILL_NOTICE, (entry) =>
+      entry.data ? new Text(entry.data.message, 0, 0) : undefined,
+    );
+    const announceSkills = (names: string[]) => {
+      for (const skill of skills.filter((skill) => names.includes(skill.name))) {
+        const estimatedTokens = Math.ceil(skill.description.length / 4);
+        pi.appendEntry(SKILL_NOTICE, {
+          message: say("loading-skill", { name: skill.name, tokens: String(estimatedTokens) }),
+        });
+      }
+    };
+
     async function decide(ctx: ExtensionContext, request: string, tools: ToolEntry[], skillPool: SkillEntry[], loadAt?: number) {
       if (config.mode !== "jev" || !request.trim() || tools.length + skillPool.length === 0) return undefined;
       const [provider, ...id] = config.classifier.split("/");
@@ -195,6 +209,8 @@ export function createJevLazyLoadExtension(options: { config?: Partial<LazyLoadC
         const entry: LazyEntry = { kind: "init", ...firstPlan(event, request, tools, loadedNames(decision)) };
         pi.appendEntry(ENTRY_TYPE, entry);
         state = readState([{ type: "custom", customType: ENTRY_TYPE, data: entry }]);
+        const preloadedSkills = firstPlan(event, "", tools, []).visibleSkills;
+        announceSkills(entry.visibleSkills.filter((name) => !preloadedSkills.includes(name)));
       } else {
         const pendingTools = state.deferredTools.filter((tool) => !state.loadedTools.has(tool.name)).map((tool) => tool.name);
         const pendingSkills = state.deferredSkills.filter((name) => !state.loadedSkills.has(name));
@@ -213,6 +229,7 @@ export function createJevLazyLoadExtension(options: { config?: Partial<LazyLoadC
           pi.appendEntry(ENTRY_TYPE, entry);
           for (const name of loadedNow.tools) state.loadedTools.add(name);
           for (const name of loadedNow.skills) state.loadedSkills.add(name);
+          announceSkills(loadedNow.skills);
         }
       }
 
@@ -223,10 +240,10 @@ export function createJevLazyLoadExtension(options: { config?: Partial<LazyLoadC
       reconciled = true;
       if (next.length !== current.length || next.some((name, index) => name !== current[index])) pi.setActiveTools(next);
 
-      // The skill list and the index come from the branch's first plan, so the prompt stays stable.
+      // Keep the first plan's membership; loading does not rewrite the index or visible skill list.
       const deferredSkills = new Set(state.deferredSkills);
       prompt.skills = prompt.skills.filter((skill) => !deferredSkills.has(skill.name));
-      const index = renderIndex(prompts.index, state);
+      const index = renderIndex(prompts.index, state, { tools, skills });
       if (index) prompt.sections[SECTION] = index;
 
       const loadedItems = [
@@ -301,6 +318,7 @@ export function createJevLazyLoadExtension(options: { config?: Partial<LazyLoadC
           byKeyword && newTools.length + skillItems.length > 0 ? say("keyword-match") : "",
         ].filter(Boolean);
         if (newTools.length + skillItems.length + already.length === 0) lines.push(say("nothing-loaded"));
+        announceSkills([...skillNames].filter((name) => !state.loadedSkills.has(name)));
         return { content: [{ type: "text", text: lines.join("\n") }], details: { tools: newTools, skills: [...skillNames] } };
       },
     });

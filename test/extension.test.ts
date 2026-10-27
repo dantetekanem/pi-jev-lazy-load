@@ -3,7 +3,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { stripVTControlCharacters } from "node:util";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
@@ -12,6 +14,8 @@ import {
   SessionManager,
   SettingsManager,
   type Skill,
+  type SessionEntry,
+  type CustomEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createJevLazyLoadExtension, DEFAULT_CONFIG, readConfig } from "../index.ts";
@@ -29,7 +33,7 @@ function kit(name: string, tools: string[], calls: string[]) {
     factory: (pi: any) => {
       for (const tool of tools) {
         pi.registerTool({
-          name: tool, label: tool, description: `${tool} for ${name}. Extra detail that stays out of the index.`,
+          name: tool, label: tool, description: `${tool} for ${name}. Use for ${name} workflows.`,
           parameters: Type.Object({}),
           async execute() {
             calls.push(tool);
@@ -109,6 +113,10 @@ async function harness(options: {
   });
   cleanups.unshift(() => session.dispose());
   await session.bindExtensions({});
+  const appendedEntries: SessionEntry[] = [];
+  cleanups.unshift(session.subscribe((event) => {
+    if (event.type === "entry_appended") appendedEntries.push(event.entry);
+  }));
 
   const requests: any[] = [];
   let steps: Step[] = [];
@@ -130,7 +138,7 @@ async function harness(options: {
     steps = script;
     await session.prompt(text);
   };
-  return { dir, session, sessionManager, requests, calls, prompt };
+  return { dir, session, sessionManager, requests, calls, prompt, appendedEntries };
 }
 
 const declared = (request: any) => getCurrentTools(request.messages).map((tool: any) => tool.name).sort();
@@ -138,7 +146,7 @@ const systemPrompt = (request: any) => getCurrentSystemPrompt(request.messages);
 const toolResults = (request: any) => request.messages.filter((message: any) => message.role === "toolResult");
 const text = (message: any) => (typeof message.content === "string" ? message.content
   : message.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n"));
-const index = (request: any) => systemPrompt(request).match(/<lazy_capabilities>[^]*?<\/lazy_capabilities>/)?.[0];
+const index = (request: any) => systemPrompt(request).match(/^<lazy_capabilities>\n[^]*?^<\/lazy_capabilities>/m)?.[0];
 
 test("offline checks reject fetch before any provider request", async () => {
   await assert.rejects(fetch("data:text/plain,fixture"), /Network disabled in offline checks/);
@@ -182,11 +190,12 @@ test("later named tools load and tree navigation restores each branch's deferral
   assert.ok(!declared(requests.at(-1)).includes("deploy_run"));
 });
 
-test("the first request declares only core and instruction-named tools, with a minimal index of the rest", async () => {
+test("the first request keeps tools deferred while describing their purpose in the index", async () => {
   const { requests, prompt } = await harness();
   await prompt("Say hello");
   assert.deepEqual(declared(requests[0]), ["bash", "edit", "load_capabilities", "read", "team_spawn", "write"]);
-  assert.match(index(requests[0]) ?? "", /--- browser-kit tools\nbrowser_open, browser_click\n--- team-kit tools\nteam_message\n--- ops-kit tools\ndeploy_run\n--- skills\ndeploy-guide, game-feel\n<\/lazy_capabilities>$/);
+  assert.match(index(requests[0]) ?? "", /--- browser-kit tools\n- browser_open: browser_open for browser-kit\. Use for browser-kit workflows\.\n- browser_click:/);
+  assert.match(index(requests[0]) ?? "", /--- skills\n- deploy-guide: deploy-guide runbook\.\n- game-feel: game-feel runbook\.\n<\/lazy_capabilities>$/);
   assert.match(systemPrompt(requests[0]), /<name>writer-voice<\/name>/);
   assert.doesNotMatch(systemPrompt(requests[0]), /<name>deploy-guide<\/name>/);
   assert.match(systemPrompt(requests[0]), /<project_instructions[^>]*>\nDelegate with `team_spawn`/);
@@ -202,7 +211,7 @@ test("Pi's extension loader loads index.ts from its path and applies jev-lazy-lo
   const { requests, prompt } = await harness({ dir, fromFile: true });
   await prompt("Say hello");
   assert.deepEqual(declared(requests[0]), ["bash", "deploy_run", "edit", "load_capabilities", "read", "team_spawn", "write"]);
-  assert.match(index(requests[0]) ?? "", /--- skills\ndeploy-guide\n<\/lazy_capabilities>$/);
+  assert.match(index(requests[0]) ?? "", /--- skills\n- deploy-guide: deploy-guide runbook\.\n<\/lazy_capabilities>$/);
 });
 
 test("the model loads deferred tools and skills explicitly during a task, and unloaded tools never run", async () => {
@@ -251,6 +260,60 @@ test("without opt-in the classifier is never called, and a hanging classifier ca
   assert.ok(Date.now() - started < 2_000);
   assert.equal(hung.length, 1);
   assert.deepEqual(declared(stalled.requests[0]), ["bash", "edit", "load_capabilities", "read", "team_spawn", "write"]);
+  assert.match(index(stalled.requests[0]) ?? "", /browser_open: browser_open for browser-kit\. Use for browser-kit workflows\./);
+});
+
+const skillNotices = (entries: SessionEntry[]) => entries.filter(
+  (entry): entry is CustomEntry => entry.type === "custom" && entry.customType === "jev-skill-load",
+);
+
+for (const firstPrompt of [true, false]) {
+  test(`Jev emits one visible skill notice on the ${firstPrompt ? "first" : "later"} prompt without adding it to model context`, async () => {
+    let selectSkill = firstPrompt;
+    const jev = fixtureJev([], (question) => selectSkill && question.includes("deploy-guide") ? 0.95 : 0.05);
+    const h = await harness({ config: { mode: "jev", classifier: "fixture-jev/judge" }, extra: [jev] });
+    await h.prompt("Plan a deployment");
+    if (!firstPrompt) {
+      assert.equal(skillNotices(h.appendedEntries).length, 0);
+      selectSkill = true;
+      await h.prompt("Now prepare the release");
+    }
+    assert.deepEqual(skillNotices(h.appendedEntries).map((entry) => entry.data), [
+      { message: "Loading skill: deploy-guide - ~6 tokens" },
+    ]);
+    const renderer = h.session.extensionRunner?.getEntryRenderer("jev-skill-load");
+    assert.ok(renderer);
+    const root = process.env.PI_PACKAGE_ROOT;
+    assert.ok(root);
+    const { CustomEntryComponent } = await import(pathToFileURL(join(root, "dist/modes/interactive/components/custom-entry.js")).href);
+    const component = new CustomEntryComponent(skillNotices(h.appendedEntries)[0], renderer);
+    assert.match(stripVTControlCharacters(component.render(80).join("\n")), /Loading skill: deploy-guide - ~6 tokens/);
+    assert.ok(component.render(20).every((line: string) => visibleWidth(line) <= 20));
+    component.invalidate();
+    assert.match(stripVTControlCharacters(component.render(80).join("\n")), /Loading skill: deploy-guide - ~6 tokens/);
+    assert.equal(h.requests.length, firstPrompt ? 1 : 2);
+    assert.doesNotMatch(JSON.stringify(h.requests), /Loading skill:/);
+    await h.prompt("Continue");
+    assert.equal(skillNotices(h.appendedEntries).length, 1);
+  });
+}
+
+test("named and explicit skill loads announce once and resume retains the notices", async () => {
+  const h = await harness();
+  await h.prompt("Use deploy-guide");
+  await h.prompt("Improve the effects", [{ tool: "load_capabilities", args: { names: ["game-feel"] } }]);
+  await h.prompt("Continue", [{ tool: "load_capabilities", args: { names: ["game-feel"] } }]);
+  assert.deepEqual(skillNotices(h.appendedEntries).map((entry) => entry.data), [
+    { message: "Loading skill: deploy-guide - ~6 tokens" },
+    { message: "Loading skill: game-feel - ~5 tokens" },
+  ]);
+  const sessionFile = h.sessionManager.getSessionFile();
+  assert.ok(sessionFile);
+  h.session.dispose();
+  const resumed = await harness({ dir: h.dir, sessionFile });
+  await resumed.prompt("Continue");
+  assert.equal(skillNotices(resumed.sessionManager.getBranch()).length, 2);
+  assert.equal(skillNotices(resumed.appendedEntries).length, 0);
 });
 
 test("Jev loading never authorizes a call that a permission gate blocks", async () => {

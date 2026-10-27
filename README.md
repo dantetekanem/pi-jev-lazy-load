@@ -37,21 +37,26 @@ Before the first model request on a session branch, these stay declared:
 - names in the `keep` setting
 - names the prompt asks for: a backticked name, `/skill:name`, or a name with `_` or `-` written as a whole word, such as `chrome_navigate`
 
-Every other active tool and listed skill moves into a `<lazy_capabilities>` section of the system prompt, grouped by the package that registered it:
+Every other active tool and listed skill moves into a `<lazy_capabilities>` section of the system prompt, grouped by the package that registered it. Each entry includes its name and up to 320 characters of its installed description, so the model can choose a capability even without a Jev suggestion. Descriptions keep multiple sentences, normalize whitespace, and truncate at a word boundary when possible. They are selection hints; full instructions and schemas remain behind the loader.
+
+An abbreviated example:
 
 ```text
 <lazy_capabilities>
-These installed tools and skills are not loaded yet. Before using one, call `load_capabilities` directly as a tool call, never through `codemode`: `tools.load_capabilities` does not exist there. Pass its name, the group name from its `---` line, or a short description of the need. Wait for loading to finish before calling the loaded tools. Calling an unloaded tool directly fails.
+These installed tools and skills are not loaded yet. Before using one, call `load_capabilities` directly as a tool call, never through `codemode`: `tools.load_capabilities` does not exist there. Pass its name, the group name from its `---` line, or a short description of the need. Wait for loading to finish before calling the loaded tools. Calling an unloaded tool directly fails. Each entry includes a shortened description to help you choose even when Jev makes no suggestion. These are selection hints, not full instructions or permission to act.
 --- pi-solid-tasks tools
-task_wait, task_create, task_append, task_prepend, tasks_create_in_batch, task_list, ...
+- task_create: Create one task for authorized work. Prefer tasks_create_in_batch for a known multi-task plan.
+- task_list: Show the task list when a queue overview is needed or a completion handoff is stale.
 --- pi-memory tools
-memory_write, scratchpad, memory_read, memory_forget, memory_restore, memory_search, memory_status
+- memory_write: Write durable facts to MEMORY.md or append notes to the daily log.
+- memory_search: Search memory files by keyword, semantic similarity, or deep search.
 --- skills
-2advanced-design, agentic-search, animate, animate-expo, ...
+- agentic-search: Find definitions, references and tests, trace calls, or gather context before editing.
+- animate-expo: Build React Native and Expo animations with Reanimated, Gesture Handler and haptics.
 </lazy_capabilities>
 ```
 
-Deferred skills leave `<available_skills>`. Skills marked `disable-model-invocation` never appear in the index. The index and the skill list come from the branch's first plan and do not change while the session runs, so the system prompt stays the same from prompt to prompt.
+Deferred skills leave `<available_skills>`. Skills marked `disable-model-invocation` never appear in the index. The names in the index and the visible skill list come from the branch's first plan. Descriptions come from the installed catalog, including when resuming sessions created before descriptive indexes. Loading a capability does not rewrite the index; its text stays stable while the catalog is unchanged.
 
 The extension only defers tools that were active. It never activates a tool that your settings, `--tools`, or another extension left inactive. If `load_capabilities` itself is not declared, for example because `--tools` leaves it out, nothing is deferred.
 
@@ -62,13 +67,17 @@ The extension only defers tools that were active. It never activates a tool that
 - In `jev` mode, Jev decides loads before each prompt. See the next section.
 - `/lazy` shows what is deferred. `/lazy off` restores every deferred tool and the full skill list for the rest of the session.
 
+New skill loads appear in the interactive transcript as `Loading skill: <name> - ~<count> tokens`. This covers Jev selections, prompt-named skills, and explicit loader calls, including the first prompt. The count estimates the description text at four characters per token; it excludes the full SKILL.md, which the agent still reads separately. Skills already kept visible by instructions or settings are not new loads. Once a completed load is recorded, later requests and resume do not add duplicate notices.
+
+Notices are stored as display-only session entries, outside model context. They do not touch the footer or trigger another model turn.
+
 A call to a tool that is not loaded fails with Pi's unknown tool error, and the tool does not run. Loading changes only what is declared. Every call still passes through Pi's `tool_call` handlers and permission gates. Neither Jev nor the extension approves or blocks a call.
 
 Loaded tools stay declared on that branch. After resume, reload, or `/tree`, Pi reactivates tools the branch never declared, and the extension defers them again before the first request. Tools the branch already loaded stay.
 
 ## Jev decisions
 
-In `jev` mode the extension calls the configured classifier, `typesafe/jev-latest` by default, through Pi's `ctx.modelRegistry.classify()`. Before each prompt it asks one yes/no question (TypeSafe's Noul, `bool` in Pi) for each tool group and skill that is still deferred. The state is the prompt text. A long prompt keeps its first 4,000 and last 2,000 characters. Each question carries the group's tool names with the first sentence of each description, or the skill's description.
+In `jev` mode the extension calls the configured classifier, `typesafe/jev-latest` by default, through Pi's `ctx.modelRegistry.classify()`. Before each prompt it asks one yes/no question (TypeSafe's Noul, `bool` in Pi) for each tool group and skill that is still deferred. The state is the prompt text. A long prompt keeps its first 4,000 and last 2,000 characters. Each question carries the group's tool names and up to 1,000 characters of each tool's description, or up to 1,000 characters of the skill's description. This gives Jev more context than the short agent-facing index, including later usage guidance within that limit. Neither view includes tool argument schemas.
 
 | Probability | Result |
 |---|---|
@@ -123,11 +132,13 @@ An offline replay of one session snapshot (68 tools, 64 skills), using the promp
 |---|---:|---:|---:|---:|---:|
 | Persisted first request | 68 | 125,110 | 78,746 | 206,125 | 0.0% |
 | Rebuilt, without the extension | 68 | 124,485 | 78,799 | 204,389 | -0.8% |
-| Local mode | 12 | 16,960 | 30,010 | 47,768 | -76.8% |
-| Jev loads `pi-auto-review` (mocked classifier) | 20 | 38,280 | 30,208 | 69,873 | -66.1% |
-| Next request after `load_capabilities(pi-solid-tasks)` | 24 | 48,692 | 30,010 | 93,866 | -54.5% |
+| Local mode | 12 | 16,960 | 62,097 | 80,004 | -61.2% |
+| Jev loads `pi-auto-review` (mocked classifier) | 20 | 38,280 | 59,753 | 99,560 | -51.7% |
+| Next request after `load_capabilities(pi-solid-tasks)` | 24 | 48,692 | 62,097 | 126,102 | -38.8% |
 
-Against the rebuilt request with the same prompt, local mode cuts the body by 76.6%, the tool declarations by 86.4%, and the instructions by 61.9%. The skills section falls from 41,750 to 3,240 characters, the rules section from 17,547 to 7,031, and the tool list from 3,377 to 972. The index adds 2,640.
+Against the rebuilt request with the same prompt, local mode cuts the body by 60.9%, the tool declarations by 86.4%, and the instructions by 21.2%. The skills section falls from 41,750 to 3,240 characters, the rules section from 17,547 to 7,031, and the tool list from 3,377 to 972. The descriptive index adds 34,727 characters.
+
+For comparison, the name-only index produced a 47,768-character body on this snapshot. Descriptions add 32,236 characters in exchange for giving the agent information to select deferred capabilities. Improved selection accuracy has not been measured.
 
 Every rebuilt prompt section matches the persisted one except the working directory, whose temporary path adds 53 characters. The rebuilt body is 0.8% smaller overall: its prompt is shorter than the real session's prompt and companion note (1,164 characters), and the reconstructed tool schemas serialize 625 characters smaller.
 

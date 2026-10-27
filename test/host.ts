@@ -32,7 +32,7 @@ for (const name of Object.keys(process.env)) {
 }
 
 const host = pathToFileURL(join(installedPiRoot(), "package.json")).href;
-const peers = new Set(["@earendil-works/pi-coding-agent", "@earendil-works/pi-ai", "typebox"]);
+const peers = new Set(["@earendil-works/pi-coding-agent", "@earendil-works/pi-ai", "@earendil-works/pi-tui", "typebox"]);
 
 registerHooks({
   resolve(specifier, context, next) {

@@ -1,4 +1,5 @@
 import type { ClassifierAnswer, ClassifierBoolQuestion, ClassifierContext, ClassifierResult } from "@earendil-works/pi-ai";
+import { summarizeDescription } from "./catalog.ts";
 import type { SkillEntry, ToolEntry } from "./catalog.ts";
 
 /** One thing Jev can decide to load: a tool group or a skill. */
@@ -31,14 +32,7 @@ const REQUEST_TAIL = 2_000;
 // TypeSafe's default limits are 64k tokens per request and 32k per question.
 const DEFAULT_MAX_REQUEST_TOKENS = 48_000;
 
-function clip(text: string, limit: number): string {
-  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
-}
-
-function firstSentence(text: string): string {
-  const line = text.trim().split(/\r?\n/)[0] ?? "";
-  return clip(line.match(/^.*?[.!?](?=\s|$)/)?.[0] ?? line, 160);
-}
+const MAX_CANDIDATE_DESCRIPTION = 1_000;
 
 /** Long requests keep their start and end, where instructions usually sit. */
 export function clipRequest(text: string): string {
@@ -52,13 +46,18 @@ export function toolCandidates(tools: ToolEntry[]): Candidate[] {
   return [...groups].map(([group, members]) => ({
     key: `tools:${group}`,
     name: group,
-    text: members.map((tool) => `- ${tool.name}: ${firstSentence(tool.description)}`).join("\n"),
+    text: members.map((tool) => `- ${tool.name}: ${summarizeDescription(tool.description, MAX_CANDIDATE_DESCRIPTION)}`).join("\n"),
     tools: members.map((tool) => tool.name),
   }));
 }
 
 export function skillCandidates(skills: SkillEntry[]): Candidate[] {
-  return skills.map((skill) => ({ key: `skill:${skill.name}`, name: skill.name, text: clip(skill.description.trim(), 500), tools: [] }));
+  return skills.map((skill) => ({
+    key: `skill:${skill.name}`,
+    name: skill.name,
+    text: summarizeDescription(skill.description, MAX_CANDIDATE_DESCRIPTION),
+    tools: [],
+  }));
 }
 
 function fill(template: string, values: Record<string, string>): string {
