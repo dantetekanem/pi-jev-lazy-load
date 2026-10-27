@@ -1,0 +1,1 @@
+These installed tools and skills are not loaded yet. Before using one, call `load_capabilities` directly as a tool call, never through `codemode`: `tools.load_capabilities` does not exist there. Pass its name, the group name from its `---` line, or a short description of the need. Wait for loading to finish before calling the loaded tools. Calling an unloaded tool directly fails.

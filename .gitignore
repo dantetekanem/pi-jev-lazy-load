@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.jsonl
+*.log
+auth.json
+jev-lazy-load.json
+measurement*.json
+goal.md
+coverage/
+.DS_Store

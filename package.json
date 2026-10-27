@@ -1,0 +1,22 @@
+{
+  "name": "pi-jev-lazy-load",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Defers Pi tool declarations and skill descriptions behind a minimal index, loading them when Jev or the model decides they are needed.",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/dantetekanem/pi-jev-lazy-load.git" },
+  "homepage": "https://github.com/dantetekanem/pi-jev-lazy-load#readme",
+  "keywords": ["pi-package", "pi-extension", "jev", "typesafe", "lazy-loading"],
+  "files": ["index.ts", "src", "prompts", "README.md", "LICENSE"],
+  "pi": { "extensions": ["./index.ts"] },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test": "node --import ./test/host.ts --test test/*.test.ts",
+    "measure": "node --import ./test/host.ts scripts/measure-payload.ts"
+  },
+  "engines": { "node": ">=22.19.0" }
+}
