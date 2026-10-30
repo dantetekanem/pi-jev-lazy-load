@@ -32,6 +32,8 @@ test("asks one yes/no question per candidate and maps probabilities to load and 
   assert.equal(decision.status, "ok");
   assert.deepEqual(decision.load.map((candidate) => candidate.key), ["tools:browser-kit"]);
   assert.deepEqual(decision.maybe.map((candidate) => candidate.key), ["skill:deploy-guide"]);
+  assert.deepEqual(decision.requests.map((request) => request.status), ["ok"]);
+  assert.ok(decision.requests[0].durationMs >= 0);
   assert.equal(seen.length, 1);
   assert.deepEqual(seen[0].state, { request: "Open the dashboard in a browser" });
   const questions = Object.values(seen[0].questions) as any[];
@@ -53,20 +55,86 @@ test("candidate descriptions retain later guidance but stay bounded for Jev", ()
   assert.match(skill.text, /…$/);
 });
 
+test("caps oversized singleton tool questions at both budgets without losing the group mapping", async () => {
+  const [candidate] = toolCandidates(Array.from({ length: 160 }, (_, index) => ({
+    name: `tool_${index}`, description: "x".repeat(1_000), group: "large-kit",
+  })));
+  assert.ok(candidate.text.length / 4 > 32_000);
+
+  for (const maxRequestTokens of [undefined, 256]) {
+    const contexts: any[] = [];
+    const options = maxRequestTokens === undefined ? {} : { maxRequestTokens };
+    const decision = await decideWithJev({
+      classify: async (context) => { contexts.push(context); return answered({ "large-kit": 0.95 })(context); },
+      request: maxRequestTokens === undefined ? "Select tools for this request" : "Select tools for this request ".repeat(1_000),
+      candidates: [candidate], templates, timeoutMs: 1_000, ...options,
+    });
+    assert.equal(decision.status, "ok");
+    assert.deepEqual(decision.load[0].tools, candidate.tools);
+    assert.equal(contexts.length, 1);
+    const context = contexts[0];
+    const question = Object.values(context.questions)[0] as any;
+    const estimatedTokens = (JSON.stringify(context.state).length + question.instructions.length
+      + question.criteria.true.length + question.criteria.false.length) / 4;
+    assert.ok(estimatedTokens <= Math.min(maxRequestTokens ?? 48_000, 32_000), `question estimated at ${estimatedTokens} tokens`);
+    assert.match(question.instructions, /…/);
+  }
+});
+
 test("classifier errors, throws, and hangs degrade to no decision without blocking", async () => {
   const failed = await decideWithJev({
     classify: async () => ({ api: "f", provider: "f", model: "j", answers: {}, stopReason: "error", errorMessage: "401", timestamp: 0 }),
     request: "deploy", candidates, templates, timeoutMs: 1_000,
   });
   assert.deepEqual([failed.status, failed.load, failed.maybe], ["error", [], []]);
+  assert.deepEqual(failed.requests.map((request) => request.status), ["error"]);
 
   const thrown = await decideWithJev({ classify: async () => { throw new Error("boom"); }, request: "deploy", candidates, templates, timeoutMs: 1_000 });
   assert.deepEqual([thrown.status, thrown.load.length], ["error", 0]);
+  assert.equal(thrown.requests[0].status, "error");
 
   const started = Date.now();
   const hung = await decideWithJev({ classify: () => new Promise(() => {}), request: "deploy", candidates, templates, timeoutMs: 40 });
   assert.deepEqual([hung.status, hung.load.length], ["timeout", 0]);
+  assert.equal(hung.requests[0].status, "timeout");
+  assert.ok(hung.requests[0].durationMs >= 30);
   assert.ok(Date.now() - started < 1_000);
+});
+
+test("deadline aborts count as timeouts; caller cancellations count as aborted requests", async () => {
+  const result = { api: "f", provider: "f", model: "j", stopReason: "aborted" as const, answers: {}, timestamp: 0 };
+  const classify = (_context: unknown, signal: AbortSignal): Promise<ClassifierResult> => new Promise((resolve) => {
+    signal.addEventListener("abort", () => resolve(result), { once: true });
+  });
+  const timed = await decideWithJev({ classify, request: "browse", candidates, templates, timeoutMs: 10 });
+  assert.equal(timed.requests[0].status, "timeout");
+  const controller = new AbortController();
+  const pending = decideWithJev({ classify, request: "browse", candidates, templates, timeoutMs: 100, signal: controller.signal });
+  controller.abort();
+  assert.equal((await pending).requests[0].status, "aborted");
+});
+
+test("request accounting retains completed batches on timeout and ignores late completions", async () => {
+  let finish!: (result: ClassifierResult) => void;
+  let calls = 0;
+  const success = { api: "f", provider: "f", model: "j", stopReason: "stop" as const, answers: {}, timestamp: 0 };
+  const decision = await decideWithJev({
+    classify: () => ++calls === 1 ? Promise.resolve(success) : new Promise((resolve) => { finish = resolve; }),
+    request: "browse", candidates: candidates.slice(0, 2), templates, timeoutMs: 20, maxRequestTokens: 64,
+  });
+  assert.equal(decision.status, "timeout");
+  assert.deepEqual(decision.requests.map((request) => request.status), ["ok", "timeout"]);
+  const recorded = structuredClone(decision.requests);
+  finish(success);
+  await Promise.resolve();
+  assert.deepEqual(decision.requests, recorded);
+
+  const partial = await decideWithJev({
+    classify: async () => ++calls % 2 ? success : { ...success, stopReason: "error" },
+    request: "browse", candidates: candidates.slice(0, 2), templates, timeoutMs: 100, maxRequestTokens: 64,
+  });
+  assert.equal(partial.status, "partial");
+  assert.deepEqual(partial.requests.map((request) => request.status), ["ok", "error"]);
 });
 
 test("splits large candidate sets into parallel requests under the token budget and clips long requests", async () => {
@@ -79,6 +147,7 @@ test("splits large candidate sets into parallel requests under the token budget 
     request: "word ".repeat(10_000), candidates: many, templates, timeoutMs: 1_000, maxRequestTokens: 12_000,
   });
   assert.ok(contexts.length > 1);
+  assert.equal(decision.requests.length, contexts.length);
   assert.equal(contexts.reduce((sum, context) => sum + Object.keys(context.questions).length, 0), 60);
   for (const context of contexts) {
     const tokens = Object.values(context.questions).reduce(

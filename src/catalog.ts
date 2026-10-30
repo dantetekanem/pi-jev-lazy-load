@@ -49,15 +49,21 @@ export function namedInBackticks(text: string, names: Iterable<string>): Set<str
 
 /**
  * Names a prompt asks for: backticked names, `/skill:name`, and distinctive names (containing `_`
- * or `-`) as whole words. Plain words such as `docs` only count in backticks.
+ * or `-`) as whole words. Unambiguous spaced aliases also match. Plain words such as `docs`
+ * only count in backticks or skill commands.
  */
 export function namedInPrompt(text: string, names: Iterable<string>): Set<string> {
   const candidates = [...names];
   const found = namedInBackticks(text, candidates);
+  const alias = (name: string) => name.toLowerCase().replace(/[_-]+/g, " ");
   for (const name of candidates) {
     const word = escapeRegExp(name);
     if (new RegExp(`/skill:${word}(?![\\w-])`).test(text)) found.add(name);
-    else if (/[_-]/.test(name) && new RegExp(`(?<![\\w-])${word}(?![\\w-])`).test(text)) found.add(name);
+    else if (/[_-]/.test(name)) {
+      const unambiguous = candidates.filter((candidate) => alias(candidate) === alias(name)).length === 1;
+      const pattern = unambiguous ? name.split(/[_-]+/).map(escapeRegExp).join("[\\s_-]+") : word;
+      if (new RegExp(`(?<![\\w-])${pattern}(?![\\w-])`, "i").test(text)) found.add(name);
+    }
   }
   return found;
 }

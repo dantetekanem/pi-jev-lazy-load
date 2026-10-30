@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Defers Pi tool declarations and skill descriptions behind a minimal index, loading them when Jev or the model decides they are needed.",
+  "description": "Automatically prepares Pi tool declarations and full skill instructions, with Jev selection and a manual loader fallback.",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/dantetekanem/pi-jev-lazy-load.git" },
   "homepage": "https://github.com/dantetekanem/pi-jev-lazy-load#readme",

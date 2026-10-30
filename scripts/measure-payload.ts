@@ -7,17 +7,17 @@
 //
 // Usage: node --import ./test/host.ts scripts/measure-payload.ts --session <file.jsonl> [--json <out>]
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { stream as codexStream } from "@earendil-works/pi-ai/api/openai-codex-responses";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { Skill } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createJevLazyLoadExtension } from "../index.ts";
 import { groupLabel } from "../src/catalog.ts";
 
-const agentDir = join(homedir(), ".pi", "agent");
+const agentDir = getAgentDir();
 const BUILTIN_TOOLS = new Set(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]);
 const { values: args } = parseArgs({
   // `pnpm run measure -- --session …` forwards the `--` itself.
@@ -255,7 +255,7 @@ async function run(options: { lazy?: Record<string, unknown>; extra?: any[]; pro
     const resourceLoader = new DefaultResourceLoader({
       cwd: dir, agentDir: dir, settingsManager,
       extensionFactories: [...stubExtensions(), hostSections, ...(options.extra ?? []),
-        ...(options.lazy ? [{ name: "jev-lazy-load", factory: createJevLazyLoadExtension({ config: options.lazy }) }] : [])],
+        ...(options.lazy ? [{ name: "jev-lazy-load", factory: createJevLazyLoadExtension({ agentDir: dir, config: options.lazy }) }] : [])],
       skillsOverride: () => ({ skills: fixture.skills, diagnostics: [] }),
       agentsFilesOverride: () => ({ agentsFiles: fixture.contextFiles }),
     });

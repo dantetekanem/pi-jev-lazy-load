@@ -30,6 +30,14 @@ test("prompt mentions accept distinctive names, backticks, and skill commands", 
   assert.deepEqual([...namedInPrompt(text, names)].sort(), ["chrome_navigate", "humanizer", "pdf", "rails-engineer"]);
 });
 
+test("prompt names accept unambiguous spaced aliases without matching longer words", () => {
+  const names = ["team-leader", "review-code", "review_code"];
+  assert.deepEqual([...namedInPrompt("Use Team Leader", names)], ["team-leader"]);
+  assert.deepEqual([...namedInPrompt("Use review code", names)], []);
+  assert.deepEqual([...namedInPrompt("Use team leadership", names)], []);
+  assert.deepEqual([...namedInPrompt("Use `review-code`", names)], ["review-code"]);
+});
+
 test("defers active tools and skills that nothing keeps", () => {
   const plan = planDeferral({
     activeTools: [tool("read", "builtin"), tool("load_capabilities", "lazy"), tool("browser_open", "browser-kit"),

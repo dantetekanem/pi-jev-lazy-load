@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
@@ -19,6 +19,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createJevLazyLoadExtension, DEFAULT_CONFIG, readConfig } from "../index.ts";
+import { Telemetry } from "../src/telemetry.ts";
+import { ACTIVATION_TYPE } from "../src/activation.ts";
+import type { ActivationReceipt } from "../src/activation.ts";
 
 type Step = { tool?: string; args?: Record<string, unknown> };
 const instructions = "Delegate with `team_spawn`. Load `writer-voice` for prose.";
@@ -45,7 +48,7 @@ function kit(name: string, tools: string[], calls: string[]) {
   };
 }
 
-function fixtureJev(calls: any[], answer: (instructions: string) => number | "hang") {
+function fixtureJev(calls: any[], answer: (instructions: string) => number | "hang", fetchAttempts = 0) {
   return {
     name: "fixture-jev",
     factory: (pi: any) => pi.registerProvider("fixture-jev", {
@@ -54,8 +57,12 @@ function fixtureJev(calls: any[], answer: (instructions: string) => number | "ha
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 64_000 }],
       classifiers: {
         "fixture-system-one": {
-          async classify(_model: unknown, context: any) {
+          async classify(_model: unknown, context: any, options: any) {
             calls.push(context);
+            // The host blocks fetch; these calls only exercise the per-request observer.
+            for (let attempt = 0; attempt < fetchAttempts; attempt++) {
+              await options.fetch("https://fixture.invalid").catch(() => {});
+            }
             const entries = Object.entries(context.questions).map(([id, question]: [string, any]) => [id, answer(question.instructions)]);
             if (entries.some(([, value]) => value === "hang")) return new Promise(() => {});
             return {
@@ -100,7 +107,7 @@ async function harness(options: {
       kit("team-kit", ["team_spawn", "team_message"], calls),
       kit("ops-kit", ["deploy_run"], calls),
       ...(options.extra ?? []),
-      ...(options.fromFile ? [] : [{ name: "jev-lazy-load", factory: createJevLazyLoadExtension({ config: { mode: "local", ...options.config } }) }]),
+      ...(options.fromFile ? [] : [{ name: "jev-lazy-load", factory: createJevLazyLoadExtension({ agentDir: dir, config: { mode: "local", ...options.config } }) }]),
     ],
     ...(options.fromFile ? { additionalExtensionPaths: [fileURLToPath(new URL("../index.ts", import.meta.url))] } : {}),
     skillsOverride: () => ({ skills, diagnostics: [] }),
@@ -162,6 +169,14 @@ test("invalid configuration falls back to local defaults", () => {
   }
 });
 
+test("environment mode overrides file configuration without replacing other settings", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-jev-config-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(join(dir, "jev-lazy-load.json"), JSON.stringify({ mode: "jev", keep: ["deploy_run"] }));
+  assert.equal(readConfig(dir, {}).mode, "jev");
+  assert.deepEqual(readConfig(dir, { PI_JEV_LAZY_LOAD: "off" }), { ...DEFAULT_CONFIG, mode: "off", keep: ["deploy_run"] });
+});
+
 test("later named tools load and tree navigation restores each branch's deferral", async () => {
   const { requests, prompt, session, sessionManager } = await harness();
   await prompt("Say hello");
@@ -206,8 +221,15 @@ test("Pi's extension loader loads index.ts from its path and applies jev-lazy-lo
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   writeFileSync(join(dir, "jev-lazy-load.json"), JSON.stringify({ keep: ["deploy_run", "game-feel"] }));
   const previous = process.env.PI_CODING_AGENT_DIR;
+  const previousMode = process.env.PI_JEV_LAZY_LOAD;
   process.env.PI_CODING_AGENT_DIR = dir;
-  cleanups.push(() => (previous === undefined ? delete process.env.PI_CODING_AGENT_DIR : (process.env.PI_CODING_AGENT_DIR = previous)));
+  delete process.env.PI_JEV_LAZY_LOAD;
+  cleanups.push(() => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    if (previousMode === undefined) delete process.env.PI_JEV_LAZY_LOAD;
+    else process.env.PI_JEV_LAZY_LOAD = previousMode;
+  });
   const { requests, prompt } = await harness({ dir, fromFile: true });
   await prompt("Say hello");
   assert.deepEqual(declared(requests[0]), ["bash", "deploy_run", "edit", "load_capabilities", "read", "team_spawn", "write"]);
@@ -228,7 +250,7 @@ test("the model loads deferred tools and skills explicitly during a task, and un
   assert.ok(!declared(requests[2]).includes("deploy_run"));
   const loaded = text(toolResults(requests[2]).at(-1));
   assert.match(loaded, /browser_open, browser_click/);
-  assert.match(loaded, /deploy-guide: deploy-guide runbook\.[^\n]*skills\/deploy-guide\/SKILL\.md/);
+  assert.match(loaded, /skills\/deploy-guide\/SKILL\.md/);
   assert.deepEqual(calls, ["browser_open"]);
   assert.equal(index(requests[3]), index(requests[0]));
 });
@@ -263,57 +285,31 @@ test("without opt-in the classifier is never called, and a hanging classifier ca
   assert.match(index(stalled.requests[0]) ?? "", /browser_open: browser_open for browser-kit\. Use for browser-kit workflows\./);
 });
 
-const skillNotices = (entries: SessionEntry[]) => entries.filter(
-  (entry): entry is CustomEntry => entry.type === "custom" && entry.customType === "jev-skill-load",
-);
-
-for (const firstPrompt of [true, false]) {
-  test(`Jev emits one visible skill notice on the ${firstPrompt ? "first" : "later"} prompt without adding it to model context`, async () => {
-    let selectSkill = firstPrompt;
-    const jev = fixtureJev([], (question) => selectSkill && question.includes("deploy-guide") ? 0.95 : 0.05);
-    const h = await harness({ config: { mode: "jev", classifier: "fixture-jev/judge" }, extra: [jev] });
-    await h.prompt("Plan a deployment");
-    if (!firstPrompt) {
-      assert.equal(skillNotices(h.appendedEntries).length, 0);
-      selectSkill = true;
-      await h.prompt("Now prepare the release");
-    }
-    assert.deepEqual(skillNotices(h.appendedEntries).map((entry) => entry.data), [
-      { message: "Loading skill: deploy-guide - ~6 tokens" },
-    ]);
-    const renderer = h.session.extensionRunner?.getEntryRenderer("jev-skill-load");
-    assert.ok(renderer);
-    const root = process.env.PI_PACKAGE_ROOT;
-    assert.ok(root);
-    const { CustomEntryComponent } = await import(pathToFileURL(join(root, "dist/modes/interactive/components/custom-entry.js")).href);
-    const component = new CustomEntryComponent(skillNotices(h.appendedEntries)[0], renderer);
-    assert.match(stripVTControlCharacters(component.render(80).join("\n")), /Loading skill: deploy-guide - ~6 tokens/);
-    assert.ok(component.render(20).every((line: string) => visibleWidth(line) <= 20));
-    component.invalidate();
-    assert.match(stripVTControlCharacters(component.render(80).join("\n")), /Loading skill: deploy-guide - ~6 tokens/);
-    assert.equal(h.requests.length, firstPrompt ? 1 : 2);
-    assert.doesNotMatch(JSON.stringify(h.requests), /Loading skill:/);
-    await h.prompt("Continue");
-    assert.equal(skillNotices(h.appendedEntries).length, 1);
-  });
-}
-
-test("named and explicit skill loads announce once and resume retains the notices", async () => {
-  const h = await harness();
-  await h.prompt("Use deploy-guide");
-  await h.prompt("Improve the effects", [{ tool: "load_capabilities", args: { names: ["game-feel"] } }]);
-  await h.prompt("Continue", [{ tool: "load_capabilities", args: { names: ["game-feel"] } }]);
-  assert.deepEqual(skillNotices(h.appendedEntries).map((entry) => entry.data), [
-    { message: "Loading skill: deploy-guide - ~6 tokens" },
-    { message: "Loading skill: game-feel - ~5 tokens" },
-  ]);
-  const sessionFile = h.sessionManager.getSessionFile();
-  assert.ok(sessionFile);
-  h.session.dispose();
-  const resumed = await harness({ dir: h.dir, sessionFile });
-  await resumed.prompt("Continue");
-  assert.equal(skillNotices(resumed.sessionManager.getBranch()).length, 2);
-  assert.equal(skillNotices(resumed.appendedEntries).length, 0);
+test("a mixed automatic activation renders one native card with instruction-body estimates", async () => {
+  const jev = fixtureJev([], (question) => /browser-kit|deploy-guide/.test(question) ? 0.95 : 0.05);
+  const h = await harness({ config: { mode: "jev", classifier: "fixture-jev/judge" }, extra: [jev] });
+  await h.prompt("Prepare a deployment and inspect its status");
+  const notices = h.appendedEntries.filter((entry): entry is CustomEntry<ActivationReceipt> =>
+    entry.type === "custom" && entry.customType === ACTIVATION_TYPE);
+  assert.equal(notices.length, 1);
+  const receipt = notices[0].data;
+  assert.ok(receipt);
+  assert.deepEqual(receipt.tools.map((tool) => tool.name), ["browser_open", "browser_click"]);
+  assert.equal(receipt.skills[0].name, "deploy-guide");
+  assert.equal(receipt.skills[0].tokens, Math.ceil("# deploy-guide".length / 4));
+  const renderer = h.session.extensionRunner?.getEntryRenderer(ACTIVATION_TYPE);
+  assert.ok(renderer);
+  const root = process.env.PI_PACKAGE_ROOT;
+  assert.ok(root);
+  const { CustomEntryComponent } = await import(pathToFileURL(join(root, "dist/modes/interactive/components/custom-entry.js")).href);
+  const { initTheme } = await import(pathToFileURL(join(root, "dist/modes/interactive/theme/theme.js")).href);
+  initTheme("dark", false);
+  const component = new CustomEntryComponent(notices[0], renderer);
+  assert.match(stripVTControlCharacters(component.render(80).join("\n")), /deploy-guide/);
+  assert.ok(component.render(20).every((line: string) => visibleWidth(line) <= 20));
+  component.invalidate();
+  assert.match(stripVTControlCharacters(component.render(80).join("\n")), /browser_open/);
+  assert.equal(h.requests.length, 1);
 });
 
 test("Jev loading never authorizes a call that a permission gate blocks", async () => {
@@ -350,6 +346,103 @@ test("nothing is deferred when the loader is not declared, so no tool becomes un
   await prompt("Say hello");
   assert.deepEqual(declared(requests[0]), ["bash", "browser_open", "deploy_run", "read"]);
   assert.equal(index(requests[0]), undefined);
+});
+
+test("telemetry records first-prompt Jev loads, named/keyword loads, successful and blocked calls without model context", async () => {
+  const jev = fixtureJev([], (question) => question.includes("browser-kit") ? 0.95 : 0.01, 2);
+  const nested = { name: "nested", factory: (pi: any) => {
+    pi.registerTool({ name: "nested_call", label: "Nested", description: "Nested test call", parameters: Type.Object({}),
+      async execute(_id: string, _params: unknown, _signal: unknown, _update: unknown, ctx: any) {
+        return ctx.executeTool("browser_open", {});
+      },
+    });
+    pi.on("tool_call", (event: any) => event.toolName === "browser_click" ? { block: true, reason: "secret denial" } : undefined);
+  } };
+  const h = await harness({ config: { mode: "jev", classifier: "fixture-jev/judge", keep: ["nested_call"] }, extra: [jev, nested] });
+  await h.prompt("Secret prompt: open the page; use deploy-guide", [
+    { tool: "nested_call" }, { tool: "browser_click" },
+    { tool: "load_capabilities", args: { names: ["game-feel"] } },
+    { tool: "load_capabilities", args: { names: ["game-feel"] } },
+  ]);
+  const store = new Telemetry(join(h.dir, "jev-telemetry.jsonl"));
+  const stats = await store.stats("all", "unused");
+  assert.equal(stats.requests.ok, 1);
+  assert.deepEqual(stats.http, { started: 2, ok: 0, error: 2 });
+  assert.equal(stats.unexecutedUses, 1);
+  assert.doesNotMatch(readFileSync(store.path, "utf8"), /Secret prompt|secret denial|fixture-key|runbook|parameters/);
+  assert.deepEqual(stats.tools, [["browser_click", 1], ["browser_open", 1]]);
+  assert.deepEqual(stats.skills, [["deploy-guide", 1], ["game-feel", 1]]);
+  assert.deepEqual(stats.sources, { jev: 2, named: 2, keyword: 0 });
+  assert.equal(stats.usedLoadedPairs, 1);
+  assert.equal(stats.failedUses, 1);
+  assert.ok(stats.used.some(([name, count]) => name === "browser_open" && count === 1));
+  const requestsBefore = h.requests.length;
+  await h.prompt("/lazy stats");
+  const report = h.appendedEntries.find((entry) => entry.type === "custom" && entry.customType === "jev-stats");
+  assert.ok(report && report.type === "custom");
+  assert.match((report.data as { message: string }).message, /Classifier dispatches: 1/);
+  const renderer = h.session.extensionRunner?.getEntryRenderer("jev-stats");
+  assert.ok(renderer);
+  const root = process.env.PI_PACKAGE_ROOT!;
+  const { CustomEntryComponent } = await import(pathToFileURL(join(root, "dist/modes/interactive/components/custom-entry.js")).href);
+  const component = new CustomEntryComponent(report, renderer);
+  for (const width of [20, 80]) assert.ok(component.render(width).every((line: string) => visibleWidth(line) <= width));
+  assert.equal(h.requests.length, requestsBefore);
+  await h.prompt("Continue");
+  assert.doesNotMatch(JSON.stringify(h.requests), /Jev stats|Request wait|invoked in this view/);
+
+  const local = await harness();
+  await local.prompt("Use browser_open", [
+    { tool: "load_capabilities", args: { need: "ops" } },
+  ]);
+  const localStats = await new Telemetry(join(local.dir, "jev-telemetry.jsonl")).stats("all", "unused");
+  assert.deepEqual(localStats.sources, { jev: 0, named: 1, keyword: 1 });
+  assert.equal(localStats.requests.ok, 0);
+});
+
+test("later Jev loads and loader need use their own sources; storage failure does not break loading", async () => {
+  let browse = false;
+  const jev = fixtureJev([], (question) => question.includes("browser-kit") && browse ? 0.95 : question.includes("ops-kit") ? 0.6 : 0.01);
+  const h = await harness({ config: { mode: "jev", classifier: "fixture-jev/judge" }, extra: [jev] });
+  await h.prompt("Hello");
+  browse = true;
+  await h.prompt("Browse the status page", [{ tool: "load_capabilities", args: { names: ["game-feel"], need: "deployment" } }]);
+  const stats = await new Telemetry(join(h.dir, "jev-telemetry.jsonl")).stats("all", "unused");
+  assert.equal(stats.requests.ok, 3);
+  assert.deepEqual(stats.sources, { jev: 3, named: 1, keyword: 0 });
+  assert.ok(declared(h.requests.at(-1)).includes("deploy_run"));
+
+  const blocked = await harness();
+  mkdirSync(join(blocked.dir, "jev-telemetry.jsonl"));
+  await blocked.prompt("Use browser_open");
+  assert.ok(declared(blocked.requests[0]).includes("browser_open"));
+  await blocked.prompt("/lazy stats");
+  const report = blocked.appendedEntries.find((entry) => entry.type === "custom" && entry.customType === "jev-stats") as CustomEntry<{ message: string }>;
+  assert.ok(report.data);
+  assert.match(report.data.message, /telemetry is incomplete/);
+});
+
+test("stats survive resume without recounting loads and distinguish missing classifiers from timed-out requests", async () => {
+  const h = await harness({ config: { mode: "jev", classifier: "missing/model" } });
+  await h.prompt("Use browser_open");
+  const store = new Telemetry(join(h.dir, "jev-telemetry.jsonl"));
+  assert.equal((await store.stats("all", "unused")).decisions.error, 1);
+  assert.equal((await store.stats("all", "unused")).requests.error, 0);
+  const sessionFile = h.sessionManager.getSessionFile();
+  assert.ok(sessionFile);
+  h.session.dispose();
+  const resumed = await harness({ dir: h.dir, sessionFile });
+  await resumed.prompt("Use browser_open");
+  assert.deepEqual((await store.stats("all", "unused")).tools, [["browser_open", 1]]);
+  await resumed.prompt("/lazy stats today");
+  await resumed.prompt("/lazy stats all");
+  assert.equal(resumed.appendedEntries.filter((entry) => entry.type === "custom" && entry.customType === "jev-stats").length, 2);
+
+  const hung = await harness({ config: { mode: "jev", classifier: "fixture-jev/judge", timeoutMs: 10 }, extra: [fixtureJev([], () => "hang")] });
+  await hung.prompt("Hello");
+  const stats = await new Telemetry(join(hung.dir, "jev-telemetry.jsonl")).stats("all", "unused");
+  assert.equal(stats.decisions.timeout, 1);
+  assert.equal(stats.requests.timeout, 1);
 });
 
 test("/lazy off restores every deferred tool and the full skill list for the session", async () => {
