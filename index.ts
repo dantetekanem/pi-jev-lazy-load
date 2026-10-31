@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, isReadToolResult } from "@earendil-works/pi-coding-agent";
 import type { AgentBeforeSettleEvent, ExtensionAPI, ExtensionContext, Theme, TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Box, Text } from "@earendil-works/pi-tui";
@@ -9,8 +9,8 @@ import type { SkillEntry, ToolEntry } from "./src/catalog.ts";
 import { decideWithJev, skillCandidates, toolCandidates } from "./src/jev.ts";
 import type { Candidate, JevDecision } from "./src/jev.ts";
 import { ENTRY_TYPE, LOADER_TOOL, readState } from "./src/state.ts";
-import { ACTIVATION_TYPE, INSTRUCTIONS_TYPE, readSkill, skillInstructions } from "./src/activation.ts";
-import type { ActivationReceipt } from "./src/activation.ts";
+import { ACTIVATION_TYPE, INSTRUCTIONS_TYPE, SUPPLIED_SKILLS_TYPE, suppliedSkillNames, skillPath, readSkill, skillInstructions } from "./src/activation.ts";
+import type { ActivationReceipt, PreparedSkill } from "./src/activation.ts";
 import { Telemetry, observeFetch, renderStats } from "./src/telemetry.ts";
 import type { LoadSource } from "./src/telemetry.ts";
 
@@ -193,20 +193,69 @@ export function createJevLazyLoadExtension(options: { config?: Partial<LazyLoadC
       return decision;
     }
 
-    function pending(ctx: ExtensionContext) {
+    // Pi's skill envelopes identify command loads without comparing instruction bodies.
+    function suppliedSkills(ctx: ExtensionContext, request = "", messages = ctx.sessionManager.buildSessionContext().messages) {
+      const state = readState(ctx.sessionManager.getBranch());
+      const texts = [request, ...messages.filter((message) =>
+        message.role === "user" || (message.role === "toolResult" && !message.isError)
+        || (message.role === "custom" && !message.customType.startsWith("jev-")),
+      ).map((message) => "content" in message ? contentText(message.content) : "")];
+      const names = suppliedSkillNames(texts.join("\n"), availableSkills());
+      const supplied: PreparedSkill[] = [];
+      for (const skill of availableSkills().filter((skill) => names.has(skill.name))) {
+        if (state.preparedSkills.get(skill.name)?.filePath === skill.filePath) continue;
+        try {
+          supplied.push(readSkill(skill, "named").receipt);
+        } catch {
+          // Discovery is not a load attempt; activation still reports unavailable files.
+        }
+      }
+      return supplied;
+    }
+
+    function rememberSupplied(ctx: ExtensionContext, supplied: PreparedSkill[]) {
+      const state = readState(ctx.sessionManager.getBranch());
+      const fresh = supplied.filter((skill) => {
+        const previous = state.preparedSkills.get(skill.name);
+        return previous?.filePath !== skill.filePath || previous.hash !== skill.hash;
+      });
+      if (state.initialized && !state.off && fresh.length) pi.appendEntry(SUPPLIED_SKILLS_TYPE, { skills: fresh });
+    }
+
+    pi.on("tool_result", (event, ctx) => {
+      if (!isReadToolResult(event) || event.isError || typeof event.input.path !== "string") return;
+      const state = readState(ctx.sessionManager.getBranch());
+      if (!state.initialized || state.off || Number(event.input.offset ?? 1) > 1 || event.details?.truncation?.truncated) return;
+      const path = skillPath(event.input.path, ctx.cwd);
+      const skill = path && availableSkills().find((skill) => skillPath(skill.filePath, ctx.cwd) === path);
+      if (!skill) return;
+      try {
+        const { receipt, lineCount } = readSkill(skill, "named");
+        if (event.input.limit != null && Number(event.input.limit) < lineCount) return;
+        rememberSupplied(ctx, [receipt]);
+        // Preserve the identity when a nested caller forwards this result, including as JSON.
+        const text = skillInstructions(prompts.instructions, receipt, contentText(event.content));
+        return { content: [{ type: "text" as const, text }], structuredContent: text };
+      } catch {
+        // A failed observation must not change the underlying read result.
+      }
+    });
+
+    function pending(ctx: ExtensionContext, request = "") {
       const state = readState(ctx.sessionManager.getBranch());
       const active = new Set(pi.getActiveTools());
+      const supplied = new Set(suppliedSkills(ctx, request).map((skill) => skill.name));
       return {
         tools: registeredTools().filter((tool) => state.deferredTools.some((deferred) => deferred.name === tool.name) && !active.has(tool.name)),
-        skills: availableSkills().filter((skill) => state.preparedSkills.get(skill.name)?.filePath !== skill.filePath),
+        skills: availableSkills().filter((skill) => !supplied.has(skill.name) && state.preparedSkills.get(skill.name)?.filePath !== skill.filePath),
       };
     }
 
     async function automaticSelection(request: string, ctx: ExtensionContext, source: "request" | "context") {
       const state = readState(ctx.sessionManager.getBranch());
       if (!state.initialized || state.off || !pi.getActiveTools().includes(LOADER_TOOL)) return;
-      const pool = pending(ctx);
-      const named = namedInPrompt(request, [...pool.tools.map((tool) => tool.name), ...availableSkills().map((skill) => skill.name)]);
+      const pool = pending(ctx, request);
+      const named = namedInPrompt(request, [...pool.tools.map((tool) => tool.name), ...pool.skills.map((skill) => skill.name)]);
       const wanted = new Map([...named].map((name) => [name, "named" as LoadSource]));
       // Custom context lacks request provenance; only its explicit names are selected locally.
       const decision = source === "request"
@@ -219,6 +268,7 @@ export function createJevLazyLoadExtension(options: { config?: Partial<LazyLoadC
     }
 
     async function selectAutomatically(request: string, ctx: ExtensionContext, source: "request" | "context" = "request") {
+      rememberSupplied(ctx, suppliedSkills(ctx, request));
       const key = JSON.stringify([source, request]);
       const selection = queuedSelections.get(key) ?? await automaticSelection(request, ctx, source);
       queuedSelections.delete(key);
@@ -302,10 +352,12 @@ export function createJevLazyLoadExtension(options: { config?: Partial<LazyLoadC
 
     // Request-local instructions survive compaction and mid-run loading without duplicating history.
     pi.on("context", (event, ctx) => {
+      if (readState(ctx.sessionManager.getBranch()).off) return;
+      rememberSupplied(ctx, suppliedSkills(ctx, "", event.messages));
       const state = readState(ctx.sessionManager.getBranch());
-      if (state.off) return;
       const conversation = event.messages.filter((message) => message.role !== "custom" || message.customType !== INSTRUCTIONS_TYPE);
       const existing = conversation.map((message) => "content" in message ? contentText(message.content) : "").join("\n");
+      const supplied = suppliedSkillNames(existing, availableSkills());
       const blocks: string[] = [];
       for (const [name, prepared] of state.preparedSkills) {
         const skill = availableSkills().find((skill) => skill.name === name && skill.filePath === prepared.filePath);
@@ -313,10 +365,8 @@ export function createJevLazyLoadExtension(options: { config?: Partial<LazyLoadC
           if (!skill) throw new Error("Skill no longer in catalog");
           const { body, receipt } = readSkill(skill, prepared.source);
           failures.delete(name);
-          const instructions = skillInstructions(prompts.instructions, receipt, body);
-          if (existing.includes(instructions)) continue;
-          const content = existing.includes(body) ? say("instructions-reused") : body;
-          blocks.push(skillInstructions(prompts.instructions, receipt, content));
+          if (supplied.has(name)) continue;
+          blocks.push(skillInstructions(prompts.instructions, receipt, body));
         } catch {
           failedSkill(name, ctx);
         }

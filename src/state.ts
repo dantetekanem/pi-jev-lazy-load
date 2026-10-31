@@ -1,5 +1,5 @@
 import type { DeferredTool } from "./catalog.ts";
-import { ACTIVATION_TYPE } from "./activation.ts";
+import { ACTIVATION_TYPE, SUPPLIED_SKILLS_TYPE } from "./activation.ts";
 import type { ActivationReceipt, PreparedSkill } from "./activation.ts";
 
 export const ENTRY_TYPE = "jev-lazy-load";
@@ -45,6 +45,11 @@ export function readState(branch: readonly unknown[]): LazyState {
     preparedSkills: new Map(),
   };
   for (const entry of branch) {
+    const supplied = entry as { type?: string; customType?: string; data?: { skills: PreparedSkill[] } };
+    if (supplied.type === "custom" && supplied.customType === SUPPLIED_SKILLS_TYPE) {
+      for (const skill of supplied.data?.skills ?? []) state.preparedSkills.set(skill.name, skill);
+      continue;
+    }
     const activation = entry as { type?: string; customType?: string; data?: ActivationReceipt };
     if (activation.type === "custom" && activation.customType === ACTIVATION_TYPE && activation.data?.version === 1) {
       for (const tool of activation.data.tools) state.loadedTools.add(tool.name);

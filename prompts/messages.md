@@ -12,8 +12,6 @@ requested by name
 selected by Jev
 ## source-keyword
 keyword match
-## instructions-reused
-The complete instruction body already appears earlier in this request. Use the source location above to resolve its referenced files.
 ## failed-skill
 Unable to prepare {{name}}: its instructions are missing, unreadable, or empty. Do not assume this skill is loaded.
 ## loaded-tools

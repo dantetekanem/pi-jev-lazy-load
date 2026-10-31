@@ -1,6 +1,6 @@
 {
   "name": "pi-jev-lazy-load",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Automatically prepares Pi tool declarations and full skill instructions, with Jev selection and a manual loader fallback.",

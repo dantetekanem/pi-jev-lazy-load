@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import {
   createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
-  type CustomEntry, type SessionEntry, type Skill,
+  type CustomEntry, type ExtensionToolContext, type SessionEntry, type Skill,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createJevLazyLoadExtension } from "../index.ts";
@@ -18,7 +18,8 @@ type Step = { tool?: string; args?: Record<string, unknown>; before?: () => Prom
 
 async function fixture(options: {
   semantic?: string; broken?: "missing" | "unreadable"; dir?: string; sessionFile?: string;
-  supplemental?: string;
+  supplemental?: string; probability?: number; hideNestedRead?: boolean;
+  nestedOutput?: "content" | "structuredContent";
 } = {}) {
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), "jev-activation-"));
   if (!options.dir) cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -58,6 +59,17 @@ async function fixture(options: {
             executed.push("browser_open");
             return { content: [{ type: "text", text: "opened" }], details: undefined };
           } });
+        pi.registerTool({
+          name: "read_skill", label: "Read skill", description: "Read a fixture skill through a nested call",
+          parameters: Type.Object({}),
+          async execute(_id: string, _args: unknown, _signal: unknown, _update: unknown, ctx: ExtensionToolContext) {
+            const outcome = await ctx.executeTool("read", { path: skills[1].filePath });
+            assert.equal(outcome.isError, false);
+            const value = outcome.result[options.nestedOutput ?? "content"];
+            const text = options.hideNestedRead ? "Read completed" : JSON.stringify({ value });
+            return { content: [{ type: "text", text }], details: undefined };
+          },
+        });
         pi.on("tool_call", (event: any) => {
           observedCalls.push(event.toolName);
           if (event.toolName === "browser_open") return { block: true, reason: "fixture permission denied" };
@@ -79,7 +91,7 @@ async function fixture(options: {
           classified.push(structuredClone(context));
           return { api: "fixture-classifier", provider: "fixture-judge", model: "judge", stopReason: "stop", timestamp: Date.now(),
             answers: Object.fromEntries(Object.entries(context.questions).map(([id, question]: [string, any]) =>
-              [id, { type: "bool", probability: options.semantic && question.instructions.includes(options.semantic) ? 0.99 : 0.01 }])) };
+              [id, { type: "bool", probability: options.semantic && question.instructions.includes(options.semantic) ? (options.probability ?? 0.99) : 0.01 }])) };
         } } },
       }) },
       { name: "jev", factory: createJevLazyLoadExtension({ agentDir: dir,
@@ -143,10 +155,9 @@ test("cold ordinary request activates a catalog-visible team-leader body before 
   assert.equal(h.notices().length, 1);
 });
 
-test("reusing a skill body already in the request retains its reference directory", async () => {
+test("a skill command retains its reference directory", async () => {
   const h = await fixture();
-  const body = `${sentinel("release-guide")}\nPerform the fixture workflow carefully.`;
-  await h.prompt(`Use release-guide\n\n${body}`);
+  await h.prompt("/skill:release-guide");
 
   assert.equal(bodyCount(h.requests[0], "release-guide"), 1);
   const requestText = h.requests[0].messages.map((message: any) =>
@@ -154,8 +165,104 @@ test("reusing a skill body already in the request retains its reference director
   ).join("\n");
   assert.ok(requestText.includes(`References are relative to ${join(h.dir, "skills", "release-guide")}.`));
   assert.deepEqual(h.observedCalls, []);
-  assert.equal(h.notices().length, 1);
 });
+
+test("skill commands are already prepared before classification and explicit loader calls", async () => {
+  const h = await fixture({ semantic: "team-leader" });
+  await h.prompt("/skill:team-leader Coordinate the work", [load("team-leader"), {}]);
+  assert.equal(h.notices().length, 0);
+  assert.equal(bodyCount(h.requests.at(-1), "team-leader"), 1);
+  assert.match(JSON.stringify(results(h.requests.at(-1)).at(-1).content), /Already prepared/);
+  assert.ok(h.classified.every((context) => !JSON.stringify(context.questions).includes("team-leader")));
+  await h.prompt("Continue coordinating");
+  assert.equal(h.notices().length, 0);
+});
+
+test("full skill reads clear existing suggestions and survive reload and compaction", async () => {
+  const h = await fixture({ semantic: "release-guide", probability: 0.5 });
+  await h.prompt("Hello", [{ tool: "read", args: { path: join(h.dir, "skills/release-guide/SKILL.md"), offset: 1, limit: 100 } },
+    load("release-guide"), {}]);
+  assert.ok(JSON.stringify(h.requests[0]).includes("Possibly relevant but not loaded"));
+  assert.ok(!JSON.stringify(h.requests[1]).includes("Possibly relevant but not loaded"));
+  assert.equal(h.notices().length, 0);
+  assert.equal(bodyCount(h.requests.at(-1), "release-guide"), 1);
+  assert.match(JSON.stringify(results(h.requests.at(-1)).at(-1).content), /Already prepared/);
+  await h.session.reload();
+  await h.prompt("Continue");
+  await h.session.compact();
+  await h.prompt("Use release-guide");
+  assert.equal(bodyCount(h.requests.at(-1), "release-guide"), 1);
+  assert.equal(h.notices(true).length, 0);
+});
+
+test("skill commands track identity even when two installed skills have identical bodies", async () => {
+  const h = await fixture({ semantic: "not-selected" });
+  copyFileSync(join(h.dir, "skills/team-leader/SKILL.md"), join(h.dir, "skills/release-guide/SKILL.md"));
+  await h.prompt("/skill:team-leader Coordinate work", [load("release-guide"), {}]);
+  assert.equal(h.notices().length, 1);
+  assert.deepEqual((h.notices()[0].data as any).skills.map((skill: any) => skill.name), ["release-guide"]);
+});
+
+test("reading an unrelated file containing skill text does not mark the skill loaded", async () => {
+  const h = await fixture();
+  const unrelated = join(h.dir, "notes.md");
+  copyFileSync(join(h.dir, "skills/release-guide/SKILL.md"), unrelated);
+  await h.prompt("Hello", [{ tool: "read", args: { path: unrelated } }, load("release-guide"), {}]);
+  assert.equal(h.notices().length, 1);
+  assert.match(JSON.stringify(results(h.requests.at(-1)).at(-1).content), /Prepared complete skill instructions/);
+});
+
+test("a nested skill read whose caller discards the result still delivers prepared instructions", async () => {
+  const h = await fixture({ hideNestedRead: true });
+  await h.prompt("Use read_skill", [{ tool: "read_skill" }, load("release-guide"), {}]);
+  assert.equal(bodyCount(h.requests[1], "release-guide"), 1);
+  assert.match(JSON.stringify(results(h.requests.at(-1)).at(-1).content), /Already prepared/);
+});
+
+for (const nestedOutput of ["content", "structuredContent"] as const) {
+  test(`a full nested read forwarding ${nestedOutput} as JSON is already prepared`, async () => {
+    const h = await fixture({ nestedOutput });
+    await h.prompt("Use read_skill", [{ tool: "read_skill" }, load("release-guide"), {}]);
+    assert.equal(bodyCount(h.requests.at(-1), "release-guide"), 1);
+    assert.match(JSON.stringify(results(h.requests.at(-1)).at(-1).content), /Already prepared/);
+    assert.ok(h.notices().every((entry) => (entry.data as any).skills.length === 0));
+  });
+}
+
+test("automatically truncated skill reads still require complete preparation", async () => {
+  const h = await fixture();
+  const path = join(h.dir, "skills/release-guide/SKILL.md");
+  writeFileSync(path, `${"Instruction line\n".repeat(2100)}${sentinel("release-guide")}\n`);
+  await h.prompt("Hello", [{ tool: "read", args: { path } }, load("release-guide"), {}]);
+  assert.equal(h.notices().length, 1);
+  assert.equal(bodyCount(h.requests.at(-1), "release-guide"), 1);
+});
+
+for (const partial of [true, false]) {
+  test(`${partial ? "partial" : "failed"} reads leave skill preparation available`, async () => {
+    const h = await fixture();
+    await h.prompt("Hello", [{ tool: "read", args: {
+      path: join(h.dir, "skills/release-guide", partial ? "SKILL.md" : "missing.md"),
+      ...(partial ? { limit: 4 } : {}),
+    } }, load("release-guide"), {}]);
+    assert.equal(h.notices().length, 1);
+    assert.equal(bodyCount(h.requests.at(-1), "release-guide"), 1);
+  });
+}
+
+for (const delivery of ["steer", "followUp"] as const) {
+  test(`queued ${delivery} skill commands do not prepare instructions before delivery or duplicate them`, async () => {
+    const h = await fixture({ semantic: "not-selected" });
+    await h.prompt("Hello", [{ before: async () => {
+      assert.equal(await h.session[delivery]("/skill:release-guide Continue"), "queued");
+    } }, {}]);
+    assert.equal(bodyCount(h.requests[0], "release-guide"), 0);
+    assert.equal(bodyCount(h.requests[1], "release-guide"), 1);
+    assert.equal(h.notices().length, 0);
+    assert.ok(h.classified.filter((context) => context.state.request !== "Hello")
+      .every((context) => !JSON.stringify(context.questions).includes("release-guide")));
+  });
+}
 
 test("semantic selection can activate an instruction-kept catalog-visible skill", async () => {
   const h = await fixture({ semantic: "team-leader" });
@@ -239,23 +346,29 @@ for (const lifecycle of ["next prompt", "reload", "resume", "compaction"] as con
   });
 }
 
-test("tree navigation restores the selected branch, not an abandoned skill activation", async () => {
-  const h = await fixture();
-  await h.prompt("Hello");
-  const coldLeaf = h.sessionManager.getLeafId();
-  assert.ok(coldLeaf);
-  await h.prompt("Continue", [load("release-guide"), {}]);
-  const loadedLeaf = h.sessionManager.getLeafId();
-  assert.ok(loadedLeaf);
-  await h.session.navigateTree(coldLeaf);
-  await h.prompt("Continue on cold branch");
-  assert.equal(bodyCount(h.requests.at(-1), "release-guide"), 0);
-  assert.equal(h.notices(true).length, 0);
-  await h.session.navigateTree(loadedLeaf);
-  await h.prompt("Continue on loaded branch");
-  assert.equal(bodyCount(h.requests.at(-1), "release-guide"), 1);
-  assert.equal(h.notices(true).length, 1);
-});
+for (const source of ["loader", "command"] as const) {
+  test(`tree navigation restores the selected branch, not an abandoned ${source} skill activation`, async () => {
+    const h = await fixture();
+    await h.prompt("Hello");
+    const coldLeaf = h.sessionManager.getLeafId();
+    assert.ok(coldLeaf);
+
+    if (source === "command") await h.prompt("/skill:release-guide");
+    else await h.prompt("Continue", [load("release-guide"), {}]);
+    const loadedLeaf = h.sessionManager.getLeafId();
+    assert.ok(loadedLeaf);
+
+    await h.session.navigateTree(coldLeaf);
+    await h.prompt("Continue on cold branch");
+    assert.equal(bodyCount(h.requests.at(-1), "release-guide"), 0);
+    assert.equal(h.notices(true).length, 0);
+
+    await h.session.navigateTree(loadedLeaf);
+    await h.prompt("Continue on loaded branch");
+    assert.equal(bodyCount(h.requests.at(-1), "release-guide"), 1);
+    assert.equal(h.notices(true).length, source === "loader" ? 1 : 0);
+  });
+}
 
 for (const source of ["before_agent_start", "nextTurn", "context-only queue"] as const) {
   test(`supplemental ${source} context reaches the assistant but not the classifier`, async () => {
