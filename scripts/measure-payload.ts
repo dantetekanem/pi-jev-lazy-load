@@ -1,11 +1,11 @@
-// Measure the serialized first request with and without lazy loading, offline.
+// Measure serialized requests with and without lazy loading, offline.
 //
-// The fixture comes from a persisted Pi session on this machine: its first system message carries
-// the host's real tool declarations, skill catalog, rules, and instructions. Each scenario runs that
+// The fixture is a persisted or synthetic Pi session: its first system message carries
+// tool declarations, the skill catalog, rules, and instructions. Each scenario runs that
 // fixture through the installed Pi runtime and serializes the captured request with Pi's real
 // openai-codex-responses serializer; `onPayload` stops it before any network request.
 //
-// Usage: node --import ./test/host.ts scripts/measure-payload.ts --session <file.jsonl> [--json <out>]
+// Usage: node --import ./test/host.ts scripts/measure-payload.ts --session <file.jsonl> [--skill <name>] [--json <out>]
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
@@ -16,6 +16,7 @@ import type { Skill } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createJevLazyLoadExtension } from "../index.ts";
 import { groupLabel } from "../src/catalog.ts";
+import { readSkill, skillInstructions } from "../src/activation.ts";
 
 const agentDir = getAgentDir();
 const BUILTIN_TOOLS = new Set(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]);
@@ -24,6 +25,7 @@ const { values: args } = parseArgs({
   args: process.argv.slice(2).filter((arg, index) => index > 0 || arg !== "--"),
   options: {
     session: { type: "string" },
+    skill: { type: "string" },
     prompt: { type: "string", default: "Summarize what this project does." },
     "jev-prompt": { type: "string", default: "Review the open pull request and record the findings." },
     json: { type: "string" },
@@ -167,11 +169,13 @@ function measure(body: any) {
   const json = JSON.stringify(body);
   const input: any[] = body.input ?? [];
   const tools = [...(body.tools ?? []), ...input.flatMap((item) => (item.type === "additional_tools" ? item.tools ?? [] : []))];
+  const conversation = JSON.stringify(input.filter((item) => item.type !== "additional_tools"));
   return {
     toolCount: tools.length,
     toolChars: JSON.stringify(tools).length,
     instructionChars: (body.instructions ?? "").length,
-    conversationChars: JSON.stringify(input.filter((item) => item.type !== "additional_tools")).length,
+    conversationChars: conversation.length,
+    conversationBytes: Buffer.byteLength(conversation),
     bodyChars: json.length,
     bodyBytes: Buffer.byteLength(json),
   };
@@ -242,7 +246,7 @@ function fixtureJev(answer: (instructions: string) => number) {
   };
 }
 
-async function run(options: { lazy?: Record<string, unknown>; extra?: any[]; prompt: string; steps?: Array<{ tool: string; args: object }> }) {
+async function run(options: { lazy?: Record<string, unknown>; extra?: any[]; prompt: string; nextPrompt?: string; steps?: Array<{ tool: string; args: object }> }) {
   const dir = mkdtempSync(join(tmpdir(), "pi-jev-lazy-measure-"));
   try {
     const modelRuntime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, allowModelNetwork: false });
@@ -281,6 +285,7 @@ async function run(options: { lazy?: Record<string, unknown>; extra?: any[]; pro
       return { async *[Symbol.asyncIterator]() { yield { type: "done" }; }, result: async () => message } as any;
     }) as any;
     await session.prompt(options.prompt);
+    if (options.nextPrompt) await session.prompt(options.nextPrompt);
     const sections = contexts[0].messages.find((message: any) => message.role === "system")?.sections ?? {};
     session.dispose();
     return { model, contexts, sections: sections as Record<string, string> };
@@ -312,13 +317,59 @@ const jev = await run({
   extra: [fixtureJev((instructions) => (reviewGroup && instructions.includes(` ${reviewGroup} tools`) ? 0.9 : instructions.includes("`pr-description`") ? 0.5 : 0.05))],
 });
 
+/** Attribute JSON-escaped instruction text, excluding the surrounding JSON string quotes. */
+function measureSkill(payload: any, instructions: string, envelope: string) {
+  const json = JSON.stringify(payload);
+  const encodedBody = JSON.stringify(instructions).slice(1, -1);
+  const encodedEnvelope = JSON.stringify(envelope).slice(1, -1);
+  const skillBodyOccurrences = json.split(encodedBody).length - 1;
+  const conversation = JSON.stringify((payload.input ?? []).filter((item: any) => item.type !== "additional_tools"));
+  const skillEnvelopeOccurrences = conversation.split(encodedEnvelope).length - 1;
+  const skillBodyChars = encodedBody.length * skillEnvelopeOccurrences;
+  const skillBodyBytes = Buffer.byteLength(encodedBody) * skillEnvelopeOccurrences;
+  const skillEnvelopeChars = (encodedEnvelope.length - encodedBody.length) * skillEnvelopeOccurrences;
+  const skillEnvelopeBytes = (Buffer.byteLength(encodedEnvelope) - Buffer.byteLength(encodedBody)) * skillEnvelopeOccurrences;
+  const measured = measure(payload);
+  return {
+    ...measured,
+    skillBodyOccurrences,
+    skillEnvelopeOccurrences,
+    skillBodyChars,
+    skillBodyBytes,
+    skillEnvelopeChars,
+    skillEnvelopeBytes,
+    otherConversationChars: measured.conversationChars - skillBodyChars - skillEnvelopeChars,
+    otherConversationBytes: measured.conversationBytes - skillBodyBytes - skillEnvelopeBytes,
+  };
+}
+
+async function measureSelectedSkill(name: string) {
+  const skill = fixture.skills.find((skill) => skill.name === name);
+  if (!skill) throw new Error(`Skill not found in session catalog: ${name}`);
+  const { body, receipt } = readSkill(skill, "named");
+  const template = readFileSync(new URL("../prompts/skill-instructions.md", import.meta.url), "utf8").trim();
+  const envelope = skillInstructions(template, receipt, body);
+  const prepared = await run({
+    lazy: { mode: "local" },
+    prompt: `Use the \`${name}\` skill. ${args.prompt}`,
+    nextPrompt: `Continue using the \`${name}\` skill.`,
+  });
+  return Promise.all(prepared.contexts.map(async (context, index) => ({
+    scenario: `Selected skill ${name}, request ${index + 1} (${index === 0 ? "preparation" : "reuse"})`,
+    skill: name,
+    request: index + 1,
+    ...measureSkill(await serialize(prepared.model, context), body, envelope),
+  })));
+}
+const skillRows = args.skill ? await measureSelectedSkill(args.skill) : [];
 const persistedModel = baseline.model;
 const rows = [
-  { scenario: "Persisted first request (installed host, real session)", ...measure(await serialize(persistedModel, { messages: persisted.messages })) },
+  { scenario: "Persisted first request (session fixture)", ...measure(await serialize(persistedModel, { messages: persisted.messages })) },
   { scenario: "Rebuilt baseline, no extension", ...measure(await serialize(baseline.model, baseline.contexts[0])) },
   { scenario: "pi-jev-lazy-load, local mode", ...measure(await serialize(local.model, local.contexts[0])) },
   { scenario: `pi-jev-lazy-load, mocked Jev loads ${reviewGroup ?? "nothing"}`, ...measure(await serialize(jev.model, jev.contexts[0])) },
   ...(loaded.contexts[1] ? [{ scenario: `Next request after load_capabilities(${largestGroup})`, ...measure(await serialize(loaded.model, loaded.contexts[1])) }] : []),
+  ...skillRows,
 ];
 const sectionSizes = (sections: Record<string, string>) => Object.fromEntries(Object.entries(sections).map(([name, text]) => [name, text.length]));
 const report = {
@@ -334,12 +385,21 @@ const report = {
 if (args.json) writeFileSync(args.json, `${JSON.stringify(report, null, 2)}\n`);
 
 const number = (value: number) => value.toLocaleString("en-US");
-console.log(`Model serializer: ${report.model}; provider-measured input tokens of the persisted first request: ${number(report.providerMeasuredFirstRequestInputTokens ?? 0)}`);
+const recordedTokens = report.providerMeasuredFirstRequestInputTokens;
+console.log(`Model serializer: ${report.model}; recorded input tokens of the persisted first request: ${recordedTokens == null ? "not recorded" : number(recordedTokens)}`);
 console.log("| Scenario | Tools | Tool JSON chars | Instructions chars | Conversation chars | Body chars | Body vs persisted |");
 console.log("|---|---:|---:|---:|---:|---:|---:|");
 for (const row of rows) {
   const change = ((row.bodyChars / rows[0].bodyChars - 1) * 100).toFixed(1);
   console.log(`| ${row.scenario} | ${row.toolCount} | ${number(row.toolChars)} | ${number(row.instructionChars)} | ${number(row.conversationChars)} | ${number(row.bodyChars)} | ${change}% |`);
+}
+if (skillRows.length) {
+  console.log("\nSkill contributions (JSON-escaped chars / UTF-8 bytes; envelope excludes body):");
+  console.log("| Request | Full body matches | Envelope matches | Skill body | Skill envelope | Other conversation | Total request |");
+  console.log("|---|---:|---:|---:|---:|---:|---:|");
+  for (const row of skillRows) {
+    console.log(`| ${row.request} | ${row.skillBodyOccurrences} | ${row.skillEnvelopeOccurrences} | ${row.skillBodyChars} / ${row.skillBodyBytes} | ${row.skillEnvelopeChars} / ${row.skillEnvelopeBytes} | ${row.otherConversationChars} / ${row.otherConversationBytes} | ${row.bodyChars} / ${row.bodyBytes} |`);
+  }
 }
 console.log("\nSections (chars):", JSON.stringify(report.sections));
 console.log("Tools without a found package:", report.unattributedTools.join(", ") || "none");

@@ -153,6 +153,39 @@ The numbers below are historical measurements of metadata-only loading. They hav
 node --import ./test/host.ts scripts/measure-payload.ts --session ~/.pi/agent/sessions/<project>/<session>.jsonl
 ```
 
+### Full instructions on consecutive requests
+
+Add `--skill <catalog-name>` to measure local preparation and a second user request in the same session. Both prompts explicitly name the skill. The report adds two rows with full-body and envelope occurrence counts, JSON-escaped character counts, UTF-8 byte counts, and conversation overhead excluding that skill. The envelope contribution excludes the body; the existing tool and total-request measurements remain separate. JSON string quotes and message framing belong to conversation overhead. Character counts use JavaScript string length (UTF-16 code units). Full-body matches search the whole serialized request; attributed sizes count only complete skill envelopes in the conversation, so matching text elsewhere is not charged to skill preparation.
+
+This synthetic example uses temporary HOME and agent directories, a generated session, and a local `SKILL.md`. It reads no personal sessions or installed capability sources and makes no provider requests. Run it from the repository root:
+
+```sh
+(
+  fixture=$(mktemp -d)
+  trap 'rm -rf "$fixture"' EXIT
+  export HOME="$fixture" PI_CODING_AGENT_DIR="$fixture/agent"
+  node --input-type=module <<'JS'
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const dir = process.env.HOME;
+mkdirSync(process.env.PI_CODING_AGENT_DIR);
+writeFileSync(join(process.env.PI_CODING_AGENT_DIR, "settings.json"), '{"packages":[]}');
+const skill = join(dir, "SKILL.md");
+writeFileSync(skill, '---\nname: fixture-skill\ndescription: Offline fixture\n---\n# Synthetic instructions\n\nPreserve "quotes", café and 日本語.\n');
+writeFileSync(join(dir, "session.jsonl"), JSON.stringify({ type: "message", message: {
+  role: "system", content: "", toolsAdded: [], toolsRemoved: [], timestamp: 0,
+  sections: { skills: `<skills><skill><name>fixture-skill</name><description>Offline fixture</description><location>${skill}</location></skill></skills>` },
+} }));
+JS
+  node --import ./test/host.ts scripts/measure-payload.ts \
+    --session "$fixture/session.jsonl" --skill fixture-skill
+)
+```
+
+Use `--json <path>` to save the rows. `node --import ./test/host.ts --test test/measurement.test.ts` checks the tool-only scenario and a larger synthetic skill: each serialized request contains the complete body once, and unchanged reuse adds conversation history without another copy of the instructions. Temporary paths and installed Pi versions can affect the totals. These are serialized sizes, not provider-token counts, cache measurements, or savings claims. The scenario does not measure live selection accuracy, eviction, or compaction.
+
+### Historical metadata-only results
+
 An offline replay of one session snapshot (68 tools, 64 skills), using the prompt "Summarize what this project does.", produced:
 
 | Request | Tools | Tool JSON chars | Instructions chars | Body chars | Body vs persisted |
