@@ -51,7 +51,7 @@ export function skillPath(path: string, cwd: string): string | undefined {
   }
 }
 
-/** Read only envelope identities, including envelopes forwarded as JSON by nested tools. */
+/** Envelope metadata is untrusted; require the current installed body, including in JSON forwards. */
 export function suppliedSkillNames(text: string, skills: SkillEntry[]): Set<string> {
   const names = new Set<string>();
   const decoded = text.replace(/\\(["\\n])/g, (_, char: string) => char === "n" ? "\n" : char);
@@ -60,7 +60,14 @@ export function suppliedSkillNames(text: string, skills: SkillEntry[]): Set<stri
       const block = parseSkillBlock(match[0]);
       if (!block) continue;
       const location = block.location.replaceAll("&quot;", '"').replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&");
-      if (skills.some((skill) => skill.name === block.name && skill.filePath === location)) names.add(block.name);
+      const skill = skills.find((skill) => skill.name === block.name && skill.filePath === location);
+      if (!skill) continue;
+      try {
+        const { body } = readSkill(skill, "named");
+        if (block.content.includes(body)) names.add(skill.name);
+      } catch {
+        // Unverifiable content cannot suppress a real load or its failure report.
+      }
     }
   }
   return names;

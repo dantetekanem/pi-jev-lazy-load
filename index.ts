@@ -193,7 +193,7 @@ export function createJevLazyLoadExtension(options: { config?: Partial<LazyLoadC
       return decision;
     }
 
-    // Pi's skill envelopes identify command loads without comparing instruction bodies.
+    // Only envelopes containing the current installed instructions count as supplied.
     function suppliedSkills(ctx: ExtensionContext, request = "", messages = ctx.sessionManager.buildSessionContext().messages) {
       const state = readState(ctx.sessionManager.getBranch());
       const texts = [request, ...messages.filter((message) =>
